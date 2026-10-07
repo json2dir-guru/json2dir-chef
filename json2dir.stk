@@ -1,0 +1,614 @@
+# json2dir, written in a small stack-machine language that gen/chef.py turns
+# into the Chef recipe json2dir.chef ("JSON-to-Directory Souffle").  The source
+# started as json2dir-shakespeare's json2dir.stk.
+#
+# getc yields one byte per call (-1 at the end); out/putc collect the script,
+# which the recipe serves in one go when main ends; fail serves only the
+# message.  Variables become ingredients, stacks become mixing bowls.
+#
+# Pass 1 reads stdin into a stack (checking UTF-8 on the way) and validates the
+# whole JSON document.  Pass 2 walks it again and speaks a shell script; the
+# members of every object are visited in UTF-8 byte order of their names (and
+# the last of equal names wins) by repeatedly scanning the object for the
+# smallest name greater than the one emitted before.
+#
+# Strings on stacks: CUR, BEST and the top segment of LASTS hold a name with
+# its first byte on top and a -1 marker below it.  PATH holds the current path
+# with its last byte on top, -2 between components and -1 at the bottom.
+# The input sits in IN (next bytes, first on top) and DONE (consumed bytes),
+# with c the current byte and pos its offset, so seeking is cheap both ways.
+
+vars c pos b t a bb n target cp h dgt i smode nlen ndots nbad kind
+vars ostart vpos haveb take cmpr need ulo uhi
+stacks IN DONE TMP CUR TS BEST LASTS PATH FR TA TB
+
+proc main {
+  push CUR -2; push CUR -1
+  push TS -1; push BEST -1; push PATH -1
+  # read stdin, checking UTF-8
+  push TMP -1
+  need = 0; ulo = 128; uhi = 191
+  loop {
+    getc b
+    if b == -1 { break }
+    call utf8
+    push TMP b
+  }
+  if need != 0 { fail "the input is not valid UTF-8" }
+  push IN -1; push IN -1
+  loop {
+    pop TMP b
+    if b == -1 { break }
+    push IN b
+  }
+  pop IN c
+  pos = 0
+
+  # pass 1: validate everything
+  call ws
+  if c != '{' { fail "the root of the document must be an object" }
+  call value
+  call ws
+  if c != -1 { fail "trailing data after the JSON value" }
+
+  # pass 2: speak the script
+  target = 0; call seek
+  call ws
+  out "set -eu\n"
+  out "_j2d_fail() { printf 'json2dir: cannot create %s\\n' \"$1\" >&2; exit 1; }\n"
+  out "# Remove an existing non-directory (a symlink itself, never its target);\n"
+  out "# a real directory in the way of a non-object is an error.\n"
+  out "_j2d_clear() {\n"
+  out "  if [ -L \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n"
+  out "  elif [ -d \"$1\" ]; then printf 'json2dir: a directory is in the way: %s\\n' \"$1\" >&2; exit 1\n"
+  out "  elif [ -e \"$1\" ]; then rm -f -- \"$1\" || _j2d_fail \"$1\"\n"
+  out "  fi\n"
+  out "}\n"
+  out "_j2d_dir() {\n"
+  out "  if [ -L \"$1\" ] || { [ -e \"$1\" ] && [ ! -d \"$1\" ]; }; then rm -f -- \"$1\" || _j2d_fail \"$1\"; fi\n"
+  out "  if [ ! -d \"$1\" ]; then mkdir -- \"$1\" || _j2d_fail \"$1\"; fi\n"
+  out "}\n"
+  out "# _j2d_file path part...: the content is the parts joined by NUL bytes.\n"
+  out "_j2d_file() {\n"
+  out "  _j2d_clear \"$1\"\n"
+  out "  _j2d_path=$1; shift\n"
+  out "  {\n"
+  out "    printf '%s' \"$1\"; shift\n"
+  out "    for _j2d_part in \"$@\"; do printf '\\000%s' \"$_j2d_part\"; done\n"
+  out "  } > \"$_j2d_path\" || _j2d_fail \"$_j2d_path\"\n"
+  out "}\n"
+  out "_j2d_script() { _j2d_file \"$@\"; chmod a+x -- \"$1\" || _j2d_fail \"$1\"; }\n"
+  out "_j2d_link() { _j2d_clear \"$1\"; ln -s -- \"$2\" \"$1\" || _j2d_fail \"$1\"; }\n"
+  call emitobj
+  out "# json2dir: end\n"
+}
+
+# one byte b of the input; need/ulo/uhi carry the state between bytes
+proc utf8 {
+  if need == 0 {
+    if b < 128 { return }
+    if b < 194 { fail "the input is not valid UTF-8" }
+    if b < 224 {
+      need = 1
+      return
+    }
+    if b < 240 {
+      need = 2
+      if b == 224 { ulo = 160 }
+      if b == 237 { uhi = 159 }
+      return
+    }
+    if b < 245 {
+      need = 3
+      if b == 240 { ulo = 144 }
+      if b == 244 { uhi = 143 }
+      return
+    }
+    fail "the input is not valid UTF-8"
+  }
+  if b < ulo or b > uhi { fail "the input is not valid UTF-8" }
+  need = need - 1; ulo = 128; uhi = 191
+}
+
+# ---------------------------------------------------------------- cursor
+
+proc adv {
+  push DONE c
+  pop IN c
+  pos = pos + 1
+}
+
+proc back {
+  push IN c
+  pop DONE c
+  pos = pos - 1
+}
+
+proc seek {
+  while pos > target { call back }
+  while pos < target { call adv }
+}
+
+proc ws {
+  while c == ' ' or c == '\t' or c == '\n' or c == '\r' { call adv }
+}
+
+# ---------------------------------------------------------------- strings
+
+# a JSON string at c; every decoded byte goes to sink (see smode there)
+proc str {
+  if smode == 4 { out "'" }
+  call adv
+  loop {
+    if c == '"' {
+      call adv
+      break
+    }
+    if c == -1 { fail "unterminated string" }
+    if c < 32 { fail "control character in a string" }
+    if c == '\\' {
+      call adv
+      if c == 'u' {
+        call adv
+        call hex4
+        if cp >= 56320 and cp < 57344 { fail "lone surrogate in a string" }
+        if cp >= 55296 and cp < 56320 {
+          if c != '\\' { fail "lone surrogate in a string" }
+          call adv
+          if c != 'u' { fail "lone surrogate in a string" }
+          call adv
+          h = cp
+          call hex4
+          if cp < 56320 or cp >= 57344 { fail "lone surrogate in a string" }
+          cp = 65536 + (h - 55296) * 1024 + (cp - 56320)
+        }
+        call putcp
+      } else {
+        if c == '"' or c == '\\' or c == '/' {
+          b = c
+        } elif c == 'b' {
+          b = 8
+        } elif c == 'f' {
+          b = 12
+        } elif c == 'n' {
+          b = 10
+        } elif c == 'r' {
+          b = 13
+        } elif c == 't' {
+          b = 9
+        } else {
+          fail "bad escape in a string"
+        }
+        call sink
+        call adv
+      }
+    } else {
+      b = c
+      call sink
+      call adv
+    }
+  }
+  if smode == 4 { out "'" }
+}
+
+proc hex4 {
+  cp = 0; i = 0
+  while i < 4 {
+    if c >= '0' and c <= '9' {
+      dgt = c - '0'
+    } elif c >= 'a' and c <= 'f' {
+      dgt = c - 'a' + 10
+    } elif c >= 'A' and c <= 'F' {
+      dgt = c - 'A' + 10
+    } else {
+      fail "bad \\u escape"
+    }
+    cp = cp * 16 + dgt
+    call adv
+    i = i + 1
+  }
+}
+
+# code point cp as UTF-8
+proc putcp {
+  if cp < 128 {
+    b = cp; call sink
+  } elif cp < 2048 {
+    b = 192 + cp / 64; call sink
+    b = 128 + cp % 64; call sink
+  } elif cp < 65536 {
+    b = 224 + cp / 4096; call sink
+    b = 128 + cp / 64 % 64; call sink
+    b = 128 + cp % 64; call sink
+  } else {
+    b = 240 + cp / 262144; call sink
+    b = 128 + cp / 4096 % 64; call sink
+    b = 128 + cp / 64 % 64; call sink
+    b = 128 + cp % 64; call sink
+  }
+}
+
+# smode 0: drop, 1: check a name, 2: push to TS, 3: check a link target,
+# 4: speak as part of a single-quoted shell word (NUL splits the word)
+proc sink {
+  if smode == 1 {
+    nlen = nlen + 1
+    if b == '.' { ndots = ndots + 1 }
+    if b == '/' or b == 0 { nbad = 1 }
+  } elif smode == 2 {
+    push TS b
+  } elif smode == 3 {
+    if b == 0 { nbad = 1 }
+  } elif smode == 4 {
+    if b == 39 {
+      out "'\\''"
+    } elif b == 0 {
+      out "' '"
+    } else {
+      putc b
+    }
+  }
+}
+
+# CUR = the decoded string at c
+proc readcur {
+  loop {
+    pop CUR t
+    if t == -1 { break }
+    if t == -2 {
+      push CUR -2
+      break
+    }
+  }
+  push CUR -1
+  smode = 2
+  call str
+  loop {
+    pop TS t
+    if t == -1 { break }
+    push CUR t
+  }
+  push TS -1
+}
+
+# kind = 1 if CUR is "link", 2 if "script", else 0 (CUR is used up)
+proc kindof {
+  kind = 0
+  pop CUR t
+  if t == 'l' {
+    pop CUR t
+    if t != 'i' { return }
+    pop CUR t
+    if t != 'n' { return }
+    pop CUR t
+    if t != 'k' { return }
+    pop CUR t
+    if t == -1 { kind = 1 }
+    return
+  }
+  if t == 's' {
+    pop CUR t
+    if t != 'c' { return }
+    pop CUR t
+    if t != 'r' { return }
+    pop CUR t
+    if t != 'i' { return }
+    pop CUR t
+    if t != 'p' { return }
+    pop CUR t
+    if t != 't' { return }
+    pop CUR t
+    if t == -1 { kind = 2 }
+  }
+}
+
+# ---------------------------------------------------------------- pass 1
+
+proc value {
+  if c == '{' {
+    call object
+  } elif c == '"' {
+    smode = 0
+    call str
+  } elif c == '[' {
+    call array
+  } else {
+    fail "only objects, strings and [kind, payload] arrays are allowed"
+  }
+}
+
+proc object {
+  call adv
+  call ws
+  if c == '}' {
+    call adv
+    return
+  }
+  loop {
+    if c != '"' { fail "expected a name" }
+    smode = 1; nlen = 0; ndots = 0; nbad = 0
+    call str
+    if nbad == 1 or nlen == 0 or (ndots == nlen and nlen < 3) {
+      fail "invalid name (empty, ., .., or containing / or NUL)"
+    }
+    call ws
+    if c != ':' { fail "expected :" }
+    call adv
+    call ws
+    call value
+    call ws
+    if c == '}' {
+      call adv
+      return
+    }
+    if c != ',' { fail "expected , or }" }
+    call adv
+    call ws
+  }
+}
+
+proc array {
+  call adv
+  call ws
+  if c != '"' { fail "an array must be [\"link\", target] or [\"script\", content]" }
+  call readcur
+  call kindof
+  if kind == 0 { fail "an array must be [\"link\", target] or [\"script\", content]" }
+  call ws
+  if c != ',' { fail "an array must be [\"link\", target] or [\"script\", content]" }
+  call adv
+  call ws
+  if c != '"' { fail "an array must be [\"link\", target] or [\"script\", content]" }
+  smode = 0; nbad = 0
+  if kind == 1 { smode = 3 }
+  call str
+  if nbad == 1 { fail "a link target cannot contain NUL" }
+  call ws
+  if c != ']' { fail "an array must be [\"link\", target] or [\"script\", content]" }
+  call adv
+}
+
+# ---------------------------------------------------------------- pass 2
+
+# cmpr = sign of CUR - (top of LASTS), byte by byte
+proc cmplast {
+  n = 0
+  loop {
+    pop CUR a
+    push TA a
+    pop LASTS bb
+    push TB bb
+    n = n + 1
+    if a != bb {
+      cmpr = a - bb
+      break
+    }
+    if a == -1 {
+      cmpr = 0
+      break
+    }
+  }
+  while n > 0 {
+    pop TA a
+    push CUR a
+    pop TB bb
+    push LASTS bb
+    n = n - 1
+  }
+}
+
+# cmpr = sign of CUR - BEST
+proc cmpbest {
+  n = 0
+  loop {
+    pop CUR a
+    push TA a
+    pop BEST bb
+    push TB bb
+    n = n + 1
+    if a != bb {
+      cmpr = a - bb
+      break
+    }
+    if a == -1 {
+      cmpr = 0
+      break
+    }
+  }
+  while n > 0 {
+    pop TA a
+    push CUR a
+    pop TB bb
+    push BEST bb
+    n = n - 1
+  }
+}
+
+# BEST = CUR
+proc setbest {
+  loop {
+    pop BEST t
+    if t == -1 { break }
+  }
+  push BEST -1
+  push TA -1
+  loop {
+    pop CUR t
+    if t == -1 { break }
+    push TA t
+  }
+  push CUR -1
+  loop {
+    pop TA t
+    if t == -1 { break }
+    push CUR t
+    push BEST t
+  }
+}
+
+# top of LASTS = BEST
+proc setlast {
+  loop {
+    pop LASTS t
+    if t == -1 { break }
+  }
+  push LASTS -1
+  push TA -1
+  loop {
+    pop BEST t
+    if t == -1 { break }
+    push TA t
+  }
+  push BEST -1
+  loop {
+    pop TA t
+    if t == -1 { break }
+    push BEST t
+    push LASTS t
+  }
+}
+
+# PATH = PATH / BEST
+proc pathpush {
+  pop PATH t
+  push PATH t
+  if t != -1 { push PATH -2 }
+  push TA -1
+  loop {
+    pop BEST t
+    if t == -1 { break }
+    push PATH t
+    push TA t
+  }
+  push BEST -1
+  loop {
+    pop TA t
+    if t == -1 { break }
+    push BEST t
+  }
+}
+
+proc pathpop {
+  loop {
+    pop PATH t
+    if t == -2 { break }
+    if t == -1 {
+      push PATH -1
+      break
+    }
+  }
+}
+
+# speak PATH as a single-quoted shell word
+proc emitpath {
+  out "'"
+  push TA -1
+  loop {
+    pop PATH t
+    if t == -1 {
+      push PATH -1
+      break
+    }
+    push TA t
+  }
+  loop {
+    pop TA t
+    if t == -1 { break }
+    push PATH t
+    if t == -2 {
+      out "/"
+    } elif t == 39 {
+      out "'\\''"
+    } else {
+      putc t
+    }
+  }
+  out "'"
+}
+
+# the members of the object at c, in name order
+proc emitobj {
+  push FR ostart
+  ostart = pos
+  push LASTS -1
+  loop {
+    # find the smallest name above the last one emitted; the last of equals wins
+    target = ostart
+    call seek
+    haveb = 0
+    call adv
+    call ws
+    if c != '}' {
+      loop {
+        call readcur
+        call ws
+        call adv
+        call ws
+        call cmplast
+        if cmpr > 0 {
+          take = 1
+          if haveb == 1 {
+            call cmpbest
+            if cmpr > 0 { take = 0 }
+          }
+          if take == 1 {
+            call setbest
+            haveb = 1
+            vpos = pos
+          }
+        }
+        call value
+        call ws
+        if c == '}' { break }
+        call adv
+        call ws
+      }
+    }
+    if haveb == 0 { break }
+    call setlast
+    call pathpush
+    target = vpos
+    call seek
+    call emitval
+    call pathpop
+  }
+  loop {
+    pop LASTS t
+    if t == -1 { break }
+  }
+  pop FR ostart
+}
+
+proc emitval {
+  if c == '{' {
+    out "_j2d_dir "
+    call emitpath
+    out "\n"
+    call emitobj
+  } elif c == '"' {
+    out "_j2d_file "
+    call emitpath
+    out " "
+    smode = 4
+    call str
+    out "\n"
+  } else {
+    call adv
+    call ws
+    call readcur
+    call kindof
+    call ws
+    call adv
+    call ws
+    if kind == 1 {
+      out "_j2d_link "
+    } else {
+      out "_j2d_script "
+    }
+    call emitpath
+    out " "
+    smode = 4
+    call str
+    out "\n"
+  }
+}

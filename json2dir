@@ -1,0 +1,50 @@
+#!/bin/sh
+# The Chef recipe (json2dir.chef, run by Acme::Chef) owns UTF-8 checking, JSON parsing,
+# validation, traversal and shell generation; this launcher only moves bytes and runs
+# the generated script.
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  printf '%s\n' 'Usage: json2dir < file.json' >&2
+  exit 2
+fi
+
+script_dir=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+
+task_tmp=$(umask 077; mktemp -d "${TMPDIR:-/tmp}/json2dir.XXXXXXXXXX")
+trap 'rm -rf -- "$task_tmp"' 0
+trap 'exit 1' HUP INT TERM
+
+if ! (umask 077; cat > "$task_tmp/input.json"); then
+  printf '%s\n' "json2dir: couldn't read stdin" >&2
+  exit 1
+fi
+
+# Pure transport: "Take ... from refrigerator" reads one number per line, so every input
+# byte is written as one decimal number per line, followed by the line 256 to mark the end.
+if ! (
+  umask 077
+  { od -An -v -tu1 < "$task_tmp/input.json" | tr -s ' \n' '\n\n'; echo 256; } > "$task_tmp/input.txt"
+); then
+  printf '%s\n' "json2dir: couldn't frame the input" >&2
+  exit 1
+fi
+
+# A recipe can only serve its baking dish on stdout, so a rejected document serves its
+# message instead of a script. The script is only run if the evaluator succeeded and
+# served the end marker as the last line; otherwise what it served goes to stderr.
+status=0
+(
+  umask 077
+  "${JSON2DIR_CHEF:-chef}" "$script_dir/json2dir.chef" < "$task_tmp/input.txt" > "$task_tmp/tree.sh"
+) || status=$?
+if [ "$status" -ne 0 ] || [ "$(tail -n 1 "$task_tmp/tree.sh")" != '# json2dir: end' ]; then
+  if [ -s "$task_tmp/tree.sh" ]; then
+    tail -n 1 "$task_tmp/tree.sh" >&2
+  else
+    printf '%s\n' 'json2dir: the evaluator did not finish' >&2
+  fi
+  exit 1
+fi
+
+"${JSON2DIR_SHELL:-/bin/sh}" "$task_tmp/tree.sh"
